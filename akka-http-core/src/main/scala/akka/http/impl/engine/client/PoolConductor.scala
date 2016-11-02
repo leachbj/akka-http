@@ -80,7 +80,7 @@ private object PoolConductor {
         case SlotEvent.RequestCompletedFuture(future) ⇒ future
         case x: SlotEvent.ConnectedEagerly            ⇒ FastFuture.successful(x)
         case x                                        ⇒ throw new IllegalStateException("Unexpected " + x)
-      }
+      }.filterNot(_.isInstanceOf[SlotEvent.NoOp.type])
 
       retryMerge.out ~> slotSelector.in0
       slotSelector.out ~> route.in

@@ -5,20 +5,20 @@
 package akka.http.impl.engine.client
 
 import akka.event.LoggingAdapter
-import akka.http.impl.engine.client.PoolConductor.{ ConnectEagerlyCommand, DispatchCommand, SlotCommand }
+import akka.http.impl.engine.client.PoolConductor.{ConnectEagerlyCommand, DispatchCommand, SlotCommand}
 import akka.http.impl.engine.client.PoolSlot.SlotEvent.ConnectedEagerly
-import akka.http.scaladsl.model.{ HttpEntity, HttpRequest, HttpResponse }
+import akka.http.scaladsl.model.{HttpEntity, HttpRequest, HttpResponse}
 import akka.stream._
 import akka.stream.scaladsl._
 import akka.stream.stage.GraphStageLogic.EagerTerminateOutput
-import akka.stream.stage.{ GraphStage, GraphStageLogic, InHandler, OutHandler }
+import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 
 import scala.concurrent.Future
 import scala.language.existentials
-import scala.util.{ Failure, Success }
+import scala.util.{Failure, Success}
 import scala.collection.JavaConverters._
-
 import FlowErrorLogging._
+import akka.http.scaladsl.util.FastFuture
 
 private object PoolSlot {
   import PoolFlow.{ RequestContext, ResponseContext }
@@ -26,7 +26,7 @@ private object PoolSlot {
   sealed trait RawSlotEvent
   sealed trait SlotEvent extends RawSlotEvent
   object SlotEvent {
-    final case class RequestCompletedFuture(future: Future[RequestCompleted]) extends RawSlotEvent
+    final case class RequestCompletedFuture(future: Future[SlotEvent]) extends RawSlotEvent
     final case class RetryRequest(rc: RequestContext) extends RawSlotEvent
     final case class RequestCompleted(slotIx: Int) extends SlotEvent
     final case class Disconnected(slotIx: Int, failedRequests: Int) extends SlotEvent
@@ -35,6 +35,7 @@ private object PoolSlot {
      * Ordinary connections from slots don't produce this event
      */
     final case class ConnectedEagerly(slotIx: Int) extends SlotEvent
+    case object NoOp extends SlotEvent
   }
 
   def apply(slotIx: Int, connectionFlow: Flow[HttpRequest, HttpResponse, Any])(implicit m: Materializer): Graph[FanOutShape2[SlotCommand, ResponseContext, RawSlotEvent], Any] =
@@ -117,10 +118,19 @@ private object PoolSlot {
           val (entity, whenCompleted) = HttpEntity.captureTermination(response.entity)
           import fm.executionContext
           push(responsesOut, ResponseContext(requestContext, Success(response withEntity entity)))
-          push(eventsOut, SlotEvent.RequestCompletedFuture(whenCompleted.map(_ ⇒ SlotEvent.RequestCompleted(slotIx))))
+          // filter out errors on the entity stream back so they are not passed to the
+          // PoolConductor.  Those errors will be signalled to the PoolSlot as an
+          // error on the connectionFlow as an upstream failure which will disconnect
+          // the slot normally.
+          val completed = whenCompleted.map(_ ⇒ SlotEvent.RequestCompleted(slotIx))
+                            .recoverWith { case _ ⇒ FastFuture.successful(SlotEvent.NoOp) }
+          push(eventsOut, SlotEvent.RequestCompletedFuture(completed))
         }
 
-        override def onUpstreamFinish(): Unit = disconnect()
+        override def onUpstreamFinish(): Unit = {
+          println(s"$slotIx connection finished")
+          disconnect()
+        }
 
         override def onUpstreamFailure(ex: Throwable): Unit = {
           println(s"$slotIx connection failed with ${ex.getMessage}")
